@@ -240,41 +240,80 @@ export default function App() {
 
   const computedRoute = useMemo(() => {
     if (!countries.features.length) return [];
-    
-    const countriesWithCentroids = countries.features.map((f: any) => {
+
+    const nodes = countries.features.map((f: any) => {
       const [lng, lat] = geoCentroid(f);
       return { ...f, _centroid: { lat, lng } };
     });
 
-    let startIdx = countriesWithCentroids.findIndex((f: any) => f.properties.ISO_A3 === 'VNM');
+    const n = nodes.length;
+
+    // Precompute symmetric distance matrix as a flat Float32Array for fast access
+    const dist = new Float32Array(n * n);
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const d = getDistance(
+          nodes[i]._centroid.lat, nodes[i]._centroid.lng,
+          nodes[j]._centroid.lat, nodes[j]._centroid.lng
+        );
+        dist[i * n + j] = d;
+        dist[j * n + i] = d;
+      }
+    }
+
+    // --- Phase 1: Nearest-neighbor construction from VNM ---
+    let startIdx = nodes.findIndex((f: any) => f.properties.ISO_A3 === 'VNM');
     if (startIdx === -1) startIdx = 0;
 
-    const unvisited = [...countriesWithCentroids];
-    const route = [];
-    
-    let current = unvisited.splice(startIdx, 1)[0];
-    route.push(current);
+    const visited = new Uint8Array(n);
+    const tour: number[] = [startIdx];
+    visited[startIdx] = 1;
 
-    while (unvisited.length > 0) {
-      let nearestIdx = 0;
-      let minDistance = Infinity;
-      
-      for (let i = 0; i < unvisited.length; i++) {
-        const dist = getDistance(
-          current._centroid.lat, current._centroid.lng,
-          unvisited[i]._centroid.lat, unvisited[i]._centroid.lng
-        );
-        if (dist < minDistance) {
-          minDistance = dist;
-          nearestIdx = i;
+    for (let step = 1; step < n; step++) {
+      const last = tour[step - 1];
+      let bestDist = Infinity;
+      let bestIdx = -1;
+      const row = last * n;
+      for (let j = 0; j < n; j++) {
+        if (!visited[j] && dist[row + j] < bestDist) {
+          bestDist = dist[row + j];
+          bestIdx = j;
         }
       }
-      
-      current = unvisited.splice(nearestIdx, 1)[0];
-      route.push(current);
+      visited[bestIdx] = 1;
+      tour.push(bestIdx);
     }
-    
-    return route;
+
+    // --- Phase 2: 2-opt improvement (open path, no return to start) ---
+    // Repeatedly swap pairs of edges that reduce total distance until no gain remains.
+    let improved = true;
+    while (improved) {
+      improved = false;
+      for (let i = 0; i <= n - 3; i++) {
+        const ti = tour[i];
+        const ti1 = tour[i + 1];
+        const d_i_i1 = dist[ti * n + ti1];
+        for (let j = i + 2; j <= n - 2; j++) {
+          const tj = tour[j];
+          const tj1 = tour[j + 1];
+          // Gain from reversing segment [i+1 .. j]
+          const gain = d_i_i1 + dist[tj * n + tj1]
+                     - dist[ti * n + tj] - dist[ti1 * n + tj1];
+          if (gain > 1e-6) {
+            // Reverse the segment between i+1 and j in-place
+            let l = i + 1, r = j;
+            while (l < r) {
+              const tmp = tour[l]; tour[l] = tour[r]; tour[r] = tmp;
+              l++; r--;
+            }
+            improved = true;
+            break; // restart inner loop with updated tour
+          }
+        }
+      }
+    }
+
+    return tour.map(idx => nodes[idx]);
   }, [countries]);
 
   const visitedIsos = useMemo(() => {
@@ -317,11 +356,10 @@ export default function App() {
       flashTimer = setTimeout(() => setTravelFlash(null), 1800);
       setTravelFlash(currentCountry.properties.ISO_A3);
 
-      // Trail: last 30 hops as lines (full history shown via visitedPoints dots)
+      // Trail: full history of all hops
       if (currentTravelIndex > 0) {
-        const trailStart = Math.max(1, currentTravelIndex - 29);
         const allTrails = [];
-        for (let i = trailStart; i <= currentTravelIndex - 1; i++) {
+        for (let i = 1; i <= currentTravelIndex - 1; i++) {
           const a = computedRoute[i - 1]?._centroid;
           const b = computedRoute[i]?._centroid;
           if (!a || !b || isNaN(a.lat) || isNaN(b.lat)) continue;
@@ -470,7 +508,7 @@ export default function App() {
               if (travelFlash === d.properties.ISO_A3) return hexToRgba(color, 1.0);
               if (isCountryMatch) return hexToRgba(color, 1.0);
               if (visitedIsos.has(d.properties.ISO_A3)) return hexToRgba(color, 0.85);
-              return 'rgba(18, 18, 18, 0.65)';
+              return 'rgba(72, 72, 72, 0.75)';
             }
 
             if (selectedGenre) {
@@ -489,7 +527,7 @@ export default function App() {
             if (isTravelling) {
               if (isCountryMatch) return hexToRgba(color, 0.9);
               if (visitedIsos.has(d.properties.ISO_A3)) return hexToRgba(color, 0.6);
-              return 'rgba(18, 18, 18, 0.4)';
+              return 'rgba(60, 60, 60, 0.55)';
             }
 
             if (selectedGenre) {
@@ -508,7 +546,7 @@ export default function App() {
             if (isTravelling) {
               if (isCountryMatch) return 'rgba(255,255,255,0.9)';
               if (visitedIsos.has(d.properties.ISO_A3)) return hexToRgba(color, 0.4);
-              return 'rgba(40, 40, 40, 0.3)';
+              return 'rgba(90, 90, 90, 0.45)';
             }
 
             if (selectedGenre) {
