@@ -85,9 +85,15 @@ export default function App() {
   const [travelFlash, setTravelFlash] = useState<string | null>(null);
   const [atmosphereColor, setAtmosphereColor] = useState('#ffffff');
   const [visitedPoints, setVisitedPoints] = useState<any[]>([]);
+  const [topSongsCount, setTopSongsCount] = useState(1);
+  const [currentSongIndex, setCurrentSongIndex] = useState(0);
+  const [songDuration, setSongDuration] = useState<10 | 30>(10);
 
   const globeEl = useRef<any>();
   const containerRef = useRef<HTMLDivElement>(null);
+  const musicDataRef = useRef<Record<string, any>>({});
+  const topSongsCountRef = useRef(1);
+  const songDurationRef = useRef<10 | 30>(10);
   const [globeSize, setGlobeSize] = useState({ width: window.innerWidth, height: window.innerHeight });
 
   useEffect(() => {
@@ -133,15 +139,20 @@ export default function App() {
       let fallbackIndex = 0;
       const getFallbackSong = () => {
         if (fallbackSongs.length === 0) return null;
-        const song = fallbackSongs[fallbackIndex % fallbackSongs.length];
-        fallbackIndex++;
-        return {
-          title: song['im:name']?.label,
-          artist: song['im:artist']?.label,
-          image: song['im:image']?.[2]?.label || song['im:image']?.[0]?.label,
-          preview: song.link?.find((l: any) => l.attributes?.type?.startsWith('audio'))?.attributes?.href,
-          genre: song.category?.attributes?.term || 'Unknown'
-        };
+        // Pull 10 consecutive entries so Top N selection has enough songs for every country
+        const songs: any[] = [];
+        for (let i = 0; i < 10; i++) {
+          const song = fallbackSongs[fallbackIndex % fallbackSongs.length];
+          fallbackIndex++;
+          songs.push({
+            title: song['im:name']?.label,
+            artist: song['im:artist']?.label,
+            image: song['im:image']?.[2]?.label || song['im:image']?.[0]?.label,
+            preview: song.link?.find((l: any) => l.attributes?.type?.startsWith('audio'))?.attributes?.href,
+            genre: song.category?.attributes?.term || 'Unknown'
+          });
+        }
+        return { ...songs[0], songs };
       };
 
       const newMusicData: Record<string, any> = {};
@@ -163,19 +174,20 @@ export default function App() {
 
           if (iso2 && iso2 !== '-99') {
             try {
-              const res = await fetch(`https://itunes.apple.com/${iso2.toLowerCase()}/rss/topsongs/limit=1/json`);
+              const res = await fetch(`https://itunes.apple.com/${iso2.toLowerCase()}/rss/topsongs/limit=10/json`);
               if (res.ok) {
                 const data = await res.json();
                 const entry = data.feed?.entry;
                 if (entry) {
-                  const song = Array.isArray(entry) ? entry[0] : entry;
-                  songData = {
-                    title: song['im:name']?.label,
-                    artist: song['im:artist']?.label,
-                    image: song['im:image']?.[2]?.label || song['im:image']?.[0]?.label,
-                    preview: song.link?.find((l: any) => l.attributes?.type?.startsWith('audio'))?.attributes?.href,
-                    genre: song.category?.attributes?.term || 'Unknown'
-                  };
+                  const entries = Array.isArray(entry) ? entry : [entry];
+                  const songs = entries.map((s: any) => ({
+                    title: s['im:name']?.label,
+                    artist: s['im:artist']?.label,
+                    image: s['im:image']?.[2]?.label || s['im:image']?.[0]?.label,
+                    preview: s.link?.find((l: any) => l.attributes?.type?.startsWith('audio'))?.attributes?.href,
+                    genre: s.category?.attributes?.term || 'Unknown'
+                  }));
+                  songData = { ...songs[0], songs };
                 }
               }
             } catch (e) {
@@ -209,6 +221,10 @@ export default function App() {
       globeEl.current.controls().autoRotateSpeed = 0.5;
     }
   }, [autoRotate]);
+
+  useEffect(() => { musicDataRef.current = musicData; }, [musicData]);
+  useEffect(() => { topSongsCountRef.current = topSongsCount; }, [topSongsCount]);
+  useEffect(() => { songDurationRef.current = songDuration; }, [songDuration]);
 
   useEffect(() => {
     setTimeout(() => {
@@ -330,83 +346,99 @@ export default function App() {
 
       setSelectedCountry(currentCountry);
       setSelectedGenre(null);
-      
-      const [lng, lat] = [currentCountry._centroid.lng, currentCountry._centroid.lat];
-      if (globeEl.current) {
-        globeEl.current.pointOfView({ lat, lng, altitude: 1.6 }, 2000);
+
+      // Only perform arrival setup (camera, flash, arcs) when first landing on a country
+      if (currentSongIndex === 0) {
+        const [lng, lat] = [currentCountry._centroid.lng, currentCountry._centroid.lat];
+        if (globeEl.current) {
+          globeEl.current.pointOfView({ lat, lng, altitude: 1.6 }, 2000);
+        }
+
+        // Shift atmosphere to the current genre color
+        const genre = currentCountry.properties?._music?.genre;
+        const genreColor = genre ? getGenreColor(genre) : '#ffffff';
+        setAtmosphereColor(genreColor);
+
+        // Add centroid point for the landing country
+        setVisitedPoints(prev => [
+          ...prev.filter(p => p.iso !== currentCountry.properties.ISO_A3),
+          {
+            iso: currentCountry.properties.ISO_A3,
+            lat: currentCountry._centroid.lat,
+            lng: currentCountry._centroid.lng,
+            color: genreColor,
+          }
+        ]);
+
+        // Flash the arriving country
+        flashTimer = setTimeout(() => setTravelFlash(null), 1800);
+        setTravelFlash(currentCountry.properties.ISO_A3);
+
+        // Trail: full history of all hops
+        if (currentTravelIndex > 0) {
+          const allTrails = [];
+          for (let i = 1; i <= currentTravelIndex - 1; i++) {
+            const a = computedRoute[i - 1]?._centroid;
+            const b = computedRoute[i]?._centroid;
+            if (!a || !b || isNaN(a.lat) || isNaN(b.lat)) continue;
+            allTrails.push({
+              startLat: a.lat, startLng: a.lng,
+              endLat: b.lat, endLng: b.lng,
+              type: 'trail',
+            });
+          }
+          const prev = computedRoute[currentTravelIndex - 1]?._centroid;
+          const curr = currentCountry._centroid;
+          if (prev && !isNaN(prev.lat) && !isNaN(curr.lat)) {
+            const activeArc = { startLat: prev.lat, startLng: prev.lng, endLat: curr.lat, endLng: curr.lng };
+            setTravelArcsData([
+              ...allTrails,
+              { ...activeArc, type: 'track' },
+              { ...activeArc, type: 'comet' },
+            ]);
+          }
+        } else {
+          setTravelArcsData([]);
+        }
+
+        // Disable rings and border traces — country highlight is the signal
+        setAgentRingsData([]);
+        setAgentPathsData([]);
       }
-
-      // Shift atmosphere to the current genre color
-      const genre = currentCountry.properties?._music?.genre;
-      const genreColor = genre ? getGenreColor(genre) : '#ffffff';
-      setAtmosphereColor(genreColor);
-
-      // Add centroid point for the landing country
-      setVisitedPoints(prev => [
-        ...prev.filter(p => p.iso !== currentCountry.properties.ISO_A3),
-        {
-          iso: currentCountry.properties.ISO_A3,
-          lat: currentCountry._centroid.lat,
-          lng: currentCountry._centroid.lng,
-          color: genreColor,
-        }
-      ]);
-
-      // Flash the arriving country
-      flashTimer = setTimeout(() => setTravelFlash(null), 1800);
-      setTravelFlash(currentCountry.properties.ISO_A3);
-
-      // Trail: full history of all hops
-      if (currentTravelIndex > 0) {
-        const allTrails = [];
-        for (let i = 1; i <= currentTravelIndex - 1; i++) {
-          const a = computedRoute[i - 1]?._centroid;
-          const b = computedRoute[i]?._centroid;
-          if (!a || !b || isNaN(a.lat) || isNaN(b.lat)) continue;
-          allTrails.push({
-            startLat: a.lat, startLng: a.lng,
-            endLat: b.lat, endLng: b.lng,
-            type: 'trail',
-          });
-        }
-        const prev = computedRoute[currentTravelIndex - 1]?._centroid;
-        const curr = currentCountry._centroid;
-        if (prev && !isNaN(prev.lat) && !isNaN(curr.lat)) {
-          const activeArc = { startLat: prev.lat, startLng: prev.lng, endLat: curr.lat, endLng: curr.lng };
-          setTravelArcsData([
-            ...allTrails,
-            { ...activeArc, type: 'track' },
-            { ...activeArc, type: 'comet' },
-          ]);
-        }
-      } else {
-        setTravelArcsData([]);
-      }
-
-      // Disable rings and border traces — country highlight is the signal
-      setAgentRingsData([]);
-      setAgentPathsData([]);
 
       timer = setTimeout(() => {
-        if (currentTravelIndex < computedRoute.length - 1) {
-          setCurrentTravelIndex(prev => prev + 1);
+        const iso = currentCountry.properties.ISO_A3;
+        const songs = musicDataRef.current[iso]?.songs;
+        const availableSongs = songs?.length ?? 1;
+        const maxSongs = topSongsCountRef.current;
+
+        if (currentSongIndex < maxSongs - 1 && currentSongIndex < availableSongs - 1) {
+          // Cycle to the next song within this country
+          setCurrentSongIndex(prev => prev + 1);
         } else {
-          // Final country done — reset everything and return to global view
-          setIsTravelling(false);
-          setCurrentTravelIndex(0);
-          setTravelArcsData([]);
-          setAgentPathsData([]);
-          setAgentRingsData([]);
-          setSelectedCountry(null);
-          setAtmosphereColor('#ffffff');
-          setVisitedPoints([]);
-          setAutoRotate(true);
-          if (globeEl.current) {
-            const pov = globeEl.current.pointOfView();
-            globeEl.current.pointOfView({ lat: pov.lat, lng: pov.lng, altitude: 2 }, 2000);
+          // Done with this country — move to next
+          setCurrentSongIndex(0);
+          if (currentTravelIndex < computedRoute.length - 1) {
+            setCurrentTravelIndex(prev => prev + 1);
+          } else {
+            // Final country done — reset everything and return to global view
+            setIsTravelling(false);
+            setCurrentTravelIndex(0);
+            setCurrentSongIndex(0);
+            setTravelArcsData([]);
+            setAgentPathsData([]);
+            setAgentRingsData([]);
+            setSelectedCountry(null);
+            setAtmosphereColor('#ffffff');
+            setVisitedPoints([]);
+            setAutoRotate(true);
+            if (globeEl.current) {
+              const pov = globeEl.current.pointOfView();
+              globeEl.current.pointOfView({ lat: pov.lat, lng: pov.lng, altitude: 2 }, 2000);
+            }
           }
         }
-      }, 10000);
+      }, songDurationRef.current * 1000);
     } else if (!isTravelling) {
       if (travelArcsData.length > 0) setTravelArcsData([]);
       if (agentPathsData.length > 0) setAgentPathsData([]);
@@ -419,7 +451,7 @@ export default function App() {
       clearTimeout(timer);
       clearTimeout(flashTimer);
     };
-  }, [isTravelling, currentTravelIndex, computedRoute]);
+  }, [isTravelling, currentTravelIndex, currentSongIndex, computedRoute]);
 
   const handleCountryClick = async (polygon: any) => {
     if (selectedCountry === polygon) return;
@@ -478,6 +510,10 @@ export default function App() {
     });
     return Array.from(genres).sort();
   }, [musicData]);
+
+  const currentDisplaySong = isTravelling && selectedCountry
+    ? (musicData[selectedCountry.properties.ISO_A3]?.songs?.[currentSongIndex] ?? selectedCountry?.properties?._music)
+    : selectedCountry?.properties?._music;
 
   return (
     <div 
@@ -626,7 +662,7 @@ export default function App() {
               Sonic Nomad
             </h1>
             <p className="text-white/40 text-xs sm:text-sm mt-1 font-mono tracking-widest uppercase">
-              An agent roaming the globe · one song per country
+              An agent roaming the globe · {topSongsCount === 1 ? 'one song' : `top ${topSongsCount} songs`} per country
             </p>
           </div>
 
@@ -645,29 +681,35 @@ export default function App() {
               {selectedCountry?.properties?._music ? (
                 <div className="flex flex-col gap-4 mb-6">
                   <div className="flex items-center gap-4">
-                    {selectedCountry.properties._music.image && (
+                    {currentDisplaySong?.image && (
                       <img 
-                        src={selectedCountry.properties._music.image} 
+                        src={currentDisplaySong.image} 
                         alt="Album Art" 
                         className="w-16 h-16 rounded-xl border border-white/10 shadow-lg"
                         referrerPolicy="no-referrer"
                       />
                     )}
                     <div className="flex-1 min-w-0">
-                      <p className="font-medium text-white/90 truncate font-sans">{selectedCountry.properties._music.title}</p>
-                      <p className="text-white/60 text-sm truncate font-sans">{selectedCountry.properties._music.artist}</p>
+                      <p className="font-medium text-white/90 truncate font-sans">{currentDisplaySong?.title}</p>
+                      <p className="text-white/60 text-sm truncate font-sans">{currentDisplaySong?.artist}</p>
                       <div className="flex items-center gap-2 mt-2">
-                        <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: getGenreColor(selectedCountry.properties._music.genre) }}></div>
-                        <p className="text-white/50 text-xs font-mono truncate uppercase">{selectedCountry.properties._music.genre}</p>
+                        <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: getGenreColor(currentDisplaySong?.genre) }}></div>
+                        <p className="text-white/50 text-xs font-mono truncate uppercase">{currentDisplaySong?.genre}</p>
                       </div>
+                      {isTravelling && topSongsCount > 1 && (
+                        <p className="text-white/30 text-[10px] font-mono uppercase tracking-widest mt-1">
+                          {currentSongIndex + 1} / {Math.min(topSongsCount, musicData[selectedCountry?.properties?.ISO_A3]?.songs?.length ?? 1)}
+                        </p>
+                      )}
                     </div>
                   </div>
                   
-                  {selectedCountry.properties._music.preview && (
+                  {currentDisplaySong?.preview && (
                     <audio 
+                      key={`${selectedCountry?.properties?.ISO_A3}-${currentSongIndex}`}
                       autoPlay={isTravelling}
                       controls 
-                      src={selectedCountry.properties._music.preview} 
+                      src={currentDisplaySong.preview} 
                       className="w-full h-8 opacity-80"
                     />
                   )}
@@ -735,22 +777,49 @@ export default function App() {
             <div className="text-[8px] sm:text-[10px] text-white/30 font-mono uppercase tracking-widest pl-1">
               SYS.SRC: Apple Music RSS
             </div>
+            <div className="flex items-center gap-2">
+              <div className="flex items-center bg-black/40 backdrop-blur-xl px-1.5 py-1.5 rounded-full border border-white/10">
+                <button
+                  onClick={() => setSongDuration(10)}
+                  disabled={isTravelling}
+                  className={`text-[8px] sm:text-[10px] font-mono uppercase tracking-widest px-2.5 py-0.5 rounded-full transition-all duration-200 disabled:opacity-40 ${songDuration === 10 ? 'bg-white/20 text-white/90' : 'text-white/30 hover:text-white/50'}`}
+                >10s</button>
+                <button
+                  onClick={() => setSongDuration(30)}
+                  disabled={isTravelling}
+                  className={`text-[8px] sm:text-[10px] font-mono uppercase tracking-widest px-2.5 py-0.5 rounded-full transition-all duration-200 disabled:opacity-40 ${songDuration === 30 ? 'bg-white/20 text-white/90' : 'text-white/30 hover:text-white/50'}`}
+                >30s</button>
+              </div>
             <div className="flex items-center gap-2 sm:gap-3 bg-black/40 backdrop-blur-xl px-3 py-2 rounded-full border border-white/10 w-fit">
               <span className="text-[8px] sm:text-[10px] text-white/40 font-mono uppercase tracking-widest">Agent_Travel</span>
+              <select
+                value={topSongsCount}
+                onChange={(e) => setTopSongsCount(Number(e.target.value))}
+                disabled={isTravelling}
+                className="bg-black/60 text-white/50 font-mono text-[8px] sm:text-[10px] uppercase tracking-widest border border-white/10 rounded-full px-1.5 py-0.5 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none appearance-none"
+              >
+                <option value={1} className="bg-zinc-900 normal-case">Top 1</option>
+                <option value={3} className="bg-zinc-900 normal-case">Top 3</option>
+                <option value={5} className="bg-zinc-900 normal-case">Top 5</option>
+                <option value={10} className="bg-zinc-900 normal-case">Top 10</option>
+              </select>
               <button
                 onClick={() => {
                   if (isTravelling) {
                     setIsTravelling(false);
+                    setCurrentSongIndex(0);
                   } else {
                     setAutoRotate(false);
                     setIsTravelling(true);
                     setCurrentTravelIndex(0);
+                    setCurrentSongIndex(0);
                   }
                 }}
                 className={`w-7 sm:w-8 h-3.5 sm:h-4 rounded-full transition-colors duration-300 relative ${isTravelling ? 'bg-white/30' : 'bg-white/5'}`}
               >
                 <div className={`absolute top-0.5 left-0.5 w-2.5 sm:w-3 h-2.5 sm:h-3 rounded-full bg-white/90 transition-transform duration-300 ${isTravelling ? 'translate-x-3.5 sm:translate-x-4' : 'translate-x-0'}`} />
               </button>
+            </div>
             </div>
           </div>
 
